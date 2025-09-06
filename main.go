@@ -1,21 +1,18 @@
 package main
 
 import (
-	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
+	"bufio"
+	"context"
 	"embed"
-	"encoding/binary"
-	"encoding/json"
-	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,581 +28,361 @@ var (
 	FrpVersion = "unknown"
 )
 
-// FRP message types (from pkg/msg/msg.go)
-const (
-	TypeLogin             = 'o'
-	TypeLoginResp         = '1'
-	TypeNewProxy          = 'p'
-	TypeNewProxyResp      = '2'
-	TypeCloseProxy        = 'c'
-	TypeNewWorkConn       = 'w'
-	TypeReqWorkConn       = 'r'
-	TypeStartWorkConn     = 's'
-	TypeNewVisitorConn    = 'v'
-	TypeNewVisitorConnResp = '3'
-	TypePing              = 'h'
-	TypePong              = '4'
-	TypeUDPPacket         = 'u'
-	TypeNatHoleVisitor    = 'i'
-	TypeNatHoleClient     = 'n'
-	TypeNatHoleResp       = 'm'
-	TypeNatHoleClientDetectOK = 'd'
-	TypeNatHoleSid        = '5'
-)
-
-// Message structures (from pkg/msg/msg.go)
-type Login struct {
-	Version      string            `json:"version"`
-	Hostname     string            `json:"hostname"`
-	OS           string            `json:"os"`
-	Arch         string            `json:"arch"`
-	User         string            `json:"user"`
-	PrivilegeKey string            `json:"privilege_key"`
-	Timestamp    int64             `json:"timestamp"`
-	RunId        string            `json:"run_id"`
-	Metas        map[string]string `json:"metas"`
-	PoolCount    int               `json:"pool_count"`
+// ScanResult represents a scan result
+type ScanResult struct {
+	IP       string
+	Port     int
+	Success  bool
+	RunID    string
+	Duration time.Duration
+	Error    string
 }
 
-type LoginResp struct {
-	Version       string `json:"version"`
-	RunId         string `json:"run_id"`
-	ServerUDPPort int    `json:"server_udp_port"`
-	Error         string `json:"error"`
-}
-
-type NewProxy struct {
-	ProxyName         string            `json:"proxy_name"`
-	ProxyType         string            `json:"proxy_type"`
-	UseEncryption     bool              `json:"use_encryption"`
-	UseCompression    bool              `json:"use_compression"`
-	BandwidthLimit    string            `json:"bandwidth_limit"`
-	BandwidthLimitMode string           `json:"bandwidth_limit_mode"`
-	Group             string            `json:"group"`
-	GroupKey          string            `json:"group_key"`
-	LocalIP           string            `json:"local_ip"`
-	LocalPort         int               `json:"local_port"`
-	RemotePort        int               `json:"remote_port"`
-	CustomDomains     []string          `json:"custom_domains"`
-	SubDomain         string            `json:"subdomain"`
-	Locations         []string          `json:"locations"`
-	HTTPUser          string            `json:"http_user"`
-	HTTPPwd           string            `json:"http_pwd"`
-	HostHeaderRewrite string            `json:"host_header_rewrite"`
-	Headers           map[string]string `json:"headers"`
-	RouteByHTTPUser   string            `json:"route_by_http_user"`
-	Metas             map[string]string `json:"metas"`
-	Sk                string            `json:"sk"`
-	Multiplexer       string            `json:"multiplexer"`
-}
-
-type NewProxyResp struct {
-	ProxyName string `json:"proxy_name"`
-	RunId     string `json:"run_id"`
-	RemoteAddr string `json:"remote_addr"`
-	Error     string `json:"error"`
-}
-
-// BatchTester represents the main application
-type BatchTester struct {
-	serverAddr    string
-	serverPort    int
-	token         string
-	count         int
-	mode          string
-	localPort     int
-	tempDir       string
-	results       []TestResult
-	mu            sync.Mutex
-	wg            sync.WaitGroup
-}
-
-type TestResult struct {
-	ID       int           `json:"id"`
-	Success  bool          `json:"success"`
-	Error    string        `json:"error,omitempty"`
-	Duration time.Duration `json:"duration"`
-}
-
-// CryptoReadWriter implements FRP's encryption/decryption
-type CryptoReadWriter struct {
-	r         io.Reader
-	w         io.Writer
-	encryptor cipher.Stream
-	decryptor cipher.Stream
-}
-
-func NewCryptoReadWriter(rw io.ReadWriter, key []byte) (*CryptoReadWriter, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	// Generate IV for encryption
-	encryptIV := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rand.Reader, encryptIV); err != nil {
-		return nil, err
-	}
-
-	// Send IV to peer
-	if _, err := rw.Write(encryptIV); err != nil {
-		return nil, err
-	}
-
-	// Read IV from peer
-	decryptIV := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rw, decryptIV); err != nil {
-		return nil, err
-	}
-
-	encryptor := cipher.NewCFBEncrypter(block, encryptIV)
-	decryptor := cipher.NewCFBDecrypter(block, decryptIV)
-
-	return &CryptoReadWriter{
-		r:         rw,
-		w:         rw,
-		encryptor: encryptor,
-		decryptor: decryptor,
-	}, nil
-}
-
-func (crw *CryptoReadWriter) Read(p []byte) (n int, err error) {
-	n, err = crw.r.Read(p)
-	if n > 0 {
-		crw.decryptor.XORKeyStream(p[:n], p[:n])
-	}
-	return
-}
-
-func (crw *CryptoReadWriter) Write(p []byte) (n int, err error) {
-	encrypted := make([]byte, len(p))
-	crw.encryptor.XORKeyStream(encrypted, p)
-	return crw.w.Write(encrypted)
+// Scanner represents the main scanner
+type Scanner struct {
+	token       string
+	concurrency int
+	delay       time.Duration
+	timeout     time.Duration
+	results     []ScanResult
+	mu          sync.Mutex
+	wg          sync.WaitGroup
+	tempDir     string
 }
 
 func main() {
-	var (
-		serverAddr = flag.String("server", "", "FRP server address (required)")
-		serverPort = flag.Int("port", 7000, "FRP server port")
-		token      = flag.String("token", "", "FRP authentication token")
-		count      = flag.Int("count", 5, "Number of concurrent frpc instances")
-		mode       = flag.String("mode", "batch", "Mode: 'batch' for testing, 'proxy' for protocol analysis")
-		localPort  = flag.Int("local-port", 7001, "Local port for proxy mode")
-		version    = flag.Bool("version", false, "Show version information")
-		help       = flag.Bool("help", false, "Show help")
-	)
-	flag.Parse()
+	printBanner()
 
-	if *help {
-		showHelp()
-		return
+	// Get user input
+	target, token, concurrency, delay := getUserInput()
+
+	scanner := &Scanner{
+		token:       token,
+		concurrency: concurrency,
+		delay:       delay,
+		timeout:     10 * time.Second,
 	}
 
-	if *version {
-		fmt.Printf("FRP Batch Tester\n")
-		fmt.Printf("Version: %s\n", Version)
-		fmt.Printf("Build Time: %s\n", BuildTime)
-		fmt.Printf("FRP Version: %s\n", FrpVersion)
-		fmt.Printf("Go Version: %s\n", runtime.Version())
-		fmt.Printf("Platform: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-		return
-	}
-
-	if *serverAddr == "" {
-		fmt.Fprintf(os.Stderr, "Error: --server is required\n\n")
-		showHelp()
-		os.Exit(1)
-	}
-
-	bt := &BatchTester{
-		serverAddr: *serverAddr,
-		serverPort: *serverPort,
-		token:      *token,
-		count:      *count,
-		mode:       *mode,
-		localPort:  *localPort,
-	}
-
-	if err := bt.run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func showHelp() {
-	fmt.Printf(`FRP Batch Tester - Multi-instance testing and protocol analysis tool
-
-USAGE:
-    %s [OPTIONS]
-
-OPTIONS:
-    --server <addr>     FRP server address (required)
-    --port <port>       FRP server port (default: 7000)
-    --token <token>     FRP authentication token
-    --count <num>       Number of concurrent frpc instances (default: 5)
-    --mode <mode>       Operation mode:
-                         - batch: Run multiple frpc instances (default)
-                         - proxy: Protocol analysis mode
-    --local-port <port> Local port for proxy mode (default: 7001)
-    --version           Show version information
-    --help              Show this help
-
-EXAMPLES:
-    # Batch test with 10 instances
-    %s --server your-server.com --token your-token --count 10
-
-    # Protocol analysis mode
-    %s --mode proxy --server your-server.com --token your-token
-
-    # Custom ports
-    %s --server 192.168.1.100 --port 7000 --local-port 7001 --mode proxy
-
-BUILD INFO:
-    Version: %s
-    Build Time: %s
-    FRP Version: %s
-    Platform: %s/%s
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], Version, BuildTime, FrpVersion, runtime.GOOS, runtime.GOARCH)
-}
-
-func (bt *BatchTester) run() error {
+	// Create temp directory
 	var err error
-	bt.tempDir, err = os.MkdirTemp("", "frp-batch-tester-*")
+	scanner.tempDir, err = os.MkdirTemp("", "frp-scanner-*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp directory: %v", err)
+		log("❌ Failed to create temp directory: " + err.Error())
+		os.Exit(1)
 	}
-	defer os.RemoveAll(bt.tempDir)
+	defer os.RemoveAll(scanner.tempDir)
 
-	log("Starting FRP Batch Tester")
-	log(fmt.Sprintf("Version: %s, Build: %s, FRP: %s", Version, BuildTime, FrpVersion))
-	log(fmt.Sprintf("Target: %s:%d, Mode: %s", bt.serverAddr, bt.serverPort, bt.mode))
-
-	switch bt.mode {
-	case "batch":
-		return bt.runBatchTest()
-	case "proxy":
-		return bt.runProxyMode()
-	default:
-		return fmt.Errorf("unknown mode: %s", bt.mode)
+	// Parse target and get IP list
+	ips, err := parseTarget(target)
+	if err != nil {
+		log("❌ Invalid target: " + err.Error())
+		os.Exit(1)
 	}
+
+	log(fmt.Sprintf("🎯 Target: %s (%d IPs)", target, len(ips)))
+	log(fmt.Sprintf("⚙️ Concurrency: %d, Delay: %v", concurrency, delay))
+	log(fmt.Sprintf("🔑 Token: %s", maskToken(token)))
+
+	// Start scanning
+	scanner.scan(ips)
+
+	// Show results
+	scanner.showResults()
 }
 
-func (bt *BatchTester) runProxyMode() error {
-	log(fmt.Sprintf("Starting proxy mode on 127.0.0.1:%d", bt.localPort))
-	log("Configure your frpc to connect to this proxy address")
-	log(fmt.Sprintf("Example: frpc -s 127.0.0.1 -P %d -t %s", bt.localPort, bt.token))
-
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", bt.localPort))
-	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %v", bt.localPort, err)
-	}
-	defer listener.Close()
-
-	log(fmt.Sprintf("✅ Proxy listening on %s", listener.Addr()))
-
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			log(fmt.Sprintf("Accept error: %v", err))
-			continue
-		}
-
-		go bt.handleProxyConnection(clientConn)
-	}
+func printBanner() {
+	fmt.Println("╔══════════════════════════════════════════════════════════════╗")
+	fmt.Println("║                    FRP Server Scanner                        ║")
+	fmt.Println("║                  Batch FRP Testing Tool                      ║")
+	fmt.Println("╠══════════════════════════════════════════════════════════════╣")
+	fmt.Printf("║ Version: %-10s Build: %-15s FRP: %-10s ║\n", Version, BuildTime, FrpVersion)
+	fmt.Printf("║ Platform: %s/%s                                     ║\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Println("╚══════════════════════════════════════════════════════════════╝")
+	fmt.Println()
 }
 
-func (bt *BatchTester) handleProxyConnection(clientConn net.Conn) {
-	defer clientConn.Close()
+func getUserInput() (string, string, int, time.Duration) {
+	reader := bufio.NewReader(os.Stdin)
 
-	clientAddr := clientConn.RemoteAddr().String()
-	log(fmt.Sprintf("📥 frpc connected from %s", clientAddr))
-
-	// Connect to real FRP server
-	serverAddr := fmt.Sprintf("%s:%d", bt.serverAddr, bt.serverPort)
-	serverConn, err := net.Dial("tcp", serverAddr)
-	if err != nil {
-		log(fmt.Sprintf("❌ Failed to connect to frps at %s: %v", serverAddr, err))
-		return
-	}
-	defer serverConn.Close()
-
-	log(fmt.Sprintf("✅ Connected to frps at %s", serverAddr))
-
-	// Set up encryption if token provided
-	var clientRW, serverRW io.ReadWriter = clientConn, serverConn
+	// Get target
+	fmt.Print("🎯 Enter target (IP address or CIDR): ")
+	target, _ := reader.ReadString('\n')
+	target = strings.TrimSpace(target)
 	
-	if bt.token != "" {
-		log("🔐 Setting up encryption...")
-		
-		// Set up crypto for client side
-		clientCrypto, err := NewCryptoReadWriter(clientConn, []byte(bt.token))
-		if err != nil {
-			log(fmt.Sprintf("❌ Failed to setup client encryption: %v", err))
-			return
-		}
-		clientRW = clientCrypto
-		
-		// Set up crypto for server side
-		serverCrypto, err := NewCryptoReadWriter(serverConn, []byte(bt.token))
-		if err != nil {
-			log(fmt.Sprintf("❌ Failed to setup server encryption: %v", err))
-			return
-		}
-		serverRW = serverCrypto
-		
-		log("✅ Encryption established")
+	if target == "" {
+		log("❌ Target cannot be empty")
+		os.Exit(1)
 	}
 
-	// Start message parsing and forwarding
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// Get token
+	fmt.Print("🔑 Enter FRP token: ")
+	token, _ := reader.ReadString('\n')
+	token = strings.TrimSpace(token)
+	
+	if token == "" {
+		log("❌ Token cannot be empty")
+		os.Exit(1)
+	}
 
-	// Client to Server (with parsing)
-	go func() {
-		defer wg.Done()
-		bt.parseAndForward(clientRW, serverRW, "frpc -> frps", true)
-	}()
+	// Get concurrency
+	fmt.Print("🚀 Enter concurrency (default 10): ")
+	concurrencyStr, _ := reader.ReadString('\n')
+	concurrencyStr = strings.TrimSpace(concurrencyStr)
+	
+	concurrency := 10
+	if concurrencyStr != "" {
+		if c, err := strconv.Atoi(concurrencyStr); err == nil && c > 0 && c <= 100 {
+			concurrency = c
+		} else {
+			log("⚠️ Invalid concurrency, using default: 10")
+		}
+	}
 
-	// Server to Client (forward only)
-	go func() {
-		defer wg.Done()
-		bt.parseAndForward(serverRW, clientRW, "frps -> frpc", false)
-	}()
+	// Get delay
+	fmt.Print("⏱️ Enter delay between requests in ms (default 100): ")
+	delayStr, _ := reader.ReadString('\n')
+	delayStr = strings.TrimSpace(delayStr)
+	
+	delay := 100 * time.Millisecond
+	if delayStr != "" {
+		if d, err := strconv.Atoi(delayStr); err == nil && d >= 0 {
+			delay = time.Duration(d) * time.Millisecond
+		} else {
+			log("⚠️ Invalid delay, using default: 100ms")
+		}
+	}
 
-	wg.Wait()
-	log(fmt.Sprintf("🔌 Connection closed: %s", clientAddr))
+	fmt.Println()
+	return target, token, concurrency, delay
 }
 
-func (bt *BatchTester) parseAndForward(src io.Reader, dst io.Writer, direction string, shouldParse bool) {
-	buffer := make([]byte, 32*1024)
-	msgBuffer := bytes.Buffer{}
+func parseTarget(target string) ([]string, error) {
+	// Check if it's a CIDR
+	if strings.Contains(target, "/") {
+		return parseCIDR(target)
+	}
 
-	for {
-		n, err := src.Read(buffer)
-		if err != nil {
-			if err != io.EOF {
-				log(fmt.Sprintf("Read error (%s): %v", direction, err))
+	// Single IP address
+	if net.ParseIP(target) == nil {
+		return nil, fmt.Errorf("invalid IP address: %s", target)
+	}
+
+	return []string{target}, nil
+}
+
+func parseCIDR(cidr string) ([]string, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CIDR: %s", cidr)
+	}
+
+	var ips []string
+	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); inc(ip) {
+		ips = append(ips, ip.String())
+	}
+
+	// Remove network and broadcast addresses for /24 and larger subnets
+	ones, _ := ipNet.Mask.Size()
+	if ones < 31 && len(ips) > 2 {
+		ips = ips[1 : len(ips)-1] // Remove first and last
+	}
+
+	return ips, nil
+}
+
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+func (s *Scanner) scan(ips []string) {
+	log(fmt.Sprintf("🚀 Starting scan of %d IPs...", len(ips)))
+	
+	// Create semaphore for concurrency control
+	semaphore := make(chan struct{}, s.concurrency)
+	s.results = make([]ScanResult, 0, len(ips))
+
+	startTime := time.Now()
+
+	for i, ip := range ips {
+		s.wg.Add(1)
+		
+		go func(ip string, index int) {
+			defer s.wg.Done()
+			
+			// Wait for semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Add delay between requests
+			if s.delay > 0 && index > 0 {
+				time.Sleep(s.delay)
 			}
-			return
-		}
 
-		// Forward the data
-		if _, err := dst.Write(buffer[:n]); err != nil {
-			log(fmt.Sprintf("Write error (%s): %v", direction, err))
-			return
-		}
-
-		// Parse messages if needed
-		if shouldParse {
-			msgBuffer.Write(buffer[:n])
-			bt.parseMessages(&msgBuffer, direction)
-		}
+			result := s.testSingleIP(ip)
+			
+			s.mu.Lock()
+			s.results = append(s.results, result)
+			if result.Success {
+				log(fmt.Sprintf("✅ [%d/%d] %s - SUCCESS (RunID: %s, %v)", 
+					len(s.results), len(ips), ip, result.RunID, result.Duration))
+			} else {
+				log(fmt.Sprintf("❌ [%d/%d] %s - FAILED (%s)", 
+					len(s.results), len(ips), ip, result.Error))
+			}
+			s.mu.Unlock()
+		}(ip, i)
 	}
+
+	s.wg.Wait()
+	
+	elapsed := time.Since(startTime)
+	log(fmt.Sprintf("⏱️ Scan completed in %v", elapsed))
 }
 
-func (bt *BatchTester) parseMessages(buffer *bytes.Buffer, direction string) {
-	for buffer.Len() >= 9 { // At least header size
-		// Read message header
-		msgType := buffer.Bytes()[0]
-		msgLen := binary.BigEndian.Uint64(buffer.Bytes()[1:9])
-
-		// Check if we have complete message
-		if buffer.Len() < int(9+msgLen) {
-			break // Wait for more data
-		}
-
-		// Extract complete message
-		header := make([]byte, 9)
-		buffer.Read(header)
-		
-		msgData := make([]byte, msgLen)
-		buffer.Read(msgData)
-
-		// Parse specific message types
-		if msgType == TypeLogin || msgType == TypeNewProxy {
-			bt.parseAndDisplayMessage(msgType, msgData, direction)
-		}
-	}
-}
-
-func (bt *BatchTester) parseAndDisplayMessage(msgType byte, data []byte, direction string) {
-	var msgName string
-	var msgObj interface{}
-
-	switch msgType {
-	case TypeLogin:
-		msgName = "Login"
-		var login Login
-		if err := json.Unmarshal(data, &login); err == nil {
-			msgObj = login
-		}
-	case TypeNewProxy:
-		msgName = "NewProxy"
-		var newProxy NewProxy
-		if err := json.Unmarshal(data, &newProxy); err == nil {
-			msgObj = newProxy
-		}
-	default:
-		return
-	}
-
-	if msgObj != nil {
-		log(fmt.Sprintf("🔍 [DECODE] %s (%s):", direction, msgName))
-		if jsonData, err := json.MarshalIndent(msgObj, "", "  "); err == nil {
-			fmt.Println(string(jsonData))
-		}
-		fmt.Println()
-	}
-}
-
-func (bt *BatchTester) runBatchTest() error {
-	// Extract frpc binary
-	frpcPath, err := bt.extractFrpcBinary()
-	if err != nil {
-		return err
-	}
-
-	log(fmt.Sprintf("Running batch test with %d instances", bt.count))
-	
-	bt.results = make([]TestResult, bt.count)
-	
-	// Run tests concurrently
-	for i := 0; i < bt.count; i++ {
-		bt.wg.Add(1)
-		go bt.runSingleTest(i, frpcPath)
-	}
-	
-	bt.wg.Wait()
-	
-	// Display results
-	bt.displayResults()
-	return nil
-}
-
-func (bt *BatchTester) runSingleTest(id int, frpcPath string) {
-	defer bt.wg.Done()
-	
+func (s *Scanner) testSingleIP(ip string) ScanResult {
 	start := time.Now()
-	result := TestResult{ID: id + 1}
-	
-	// Create config for this instance
-	configPath, err := bt.createConfig(id)
+	result := ScanResult{
+		IP:   ip,
+		Port: 7000,
+	}
+
+	// Create frpc config
+	configPath, err := s.createConfig(ip)
 	if err != nil {
-		result.Error = fmt.Sprintf("Config creation failed: %v", err)
-		bt.setResult(id, result)
-		return
+		result.Error = "Config creation failed: " + err.Error()
+		result.Duration = time.Since(start)
+		return result
 	}
 	defer os.Remove(configPath)
-	
-	// Run frpc
-	cmd := exec.Command(frpcPath, "-c", configPath)
-	
-	// Capture output
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	
-	log(fmt.Sprintf("🚀 [%d] Starting frpc...", id+1))
-	
-	if err := cmd.Start(); err != nil {
-		result.Error = fmt.Sprintf("Start failed: %v", err)
+
+	// Find frpc binary
+	frpcPath, err := s.findFrpcBinary()
+	if err != nil {
+		result.Error = "FRPC not found: " + err.Error()
 		result.Duration = time.Since(start)
-		bt.setResult(id, result)
-		return
+		return result
 	}
-	
-	// Wait for a short time then kill
-	time.Sleep(3 * time.Second)
-	
-	if cmd.Process != nil {
-		cmd.Process.Kill()
-	}
-	
-	cmd.Wait()
+
+	// Run frpc with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, frpcPath, "-c", configPath)
+	output, err := cmd.CombinedOutput()
 	
 	result.Duration = time.Since(start)
 	
-	// Check if connection was successful
-	outputStr := output.String()
-	if strings.Contains(outputStr, "login to server success") || 
-	   strings.Contains(outputStr, "start proxy success") {
-		result.Success = true
-		log(fmt.Sprintf("✅ [%d] Success", id+1))
-	} else {
-		result.Success = false
-		result.Error = "Connection failed"
-		log(fmt.Sprintf("❌ [%d] Failed", id+1))
+	if ctx.Err() == context.DeadlineExceeded {
+		result.Error = "Connection timeout"
+		return result
 	}
-	
-	bt.setResult(id, result)
+
+	if err != nil {
+		// Don't include full error output as it might be verbose
+		if strings.Contains(string(output), "connection refused") {
+			result.Error = "Connection refused"
+		} else if strings.Contains(string(output), "timeout") {
+			result.Error = "Connection timeout"
+		} else if strings.Contains(string(output), "login to server failed") {
+			result.Error = "Login failed"
+		} else {
+			result.Error = "Connection failed"
+		}
+		return result
+	}
+
+	// Parse output for success
+	outputStr := string(output)
+	if runID := extractRunID(outputStr); runID != "" {
+		result.Success = true
+		result.RunID = runID
+	} else {
+		result.Error = "No run ID found in response"
+		if strings.Contains(outputStr, "connection refused") {
+			result.Error = "Connection refused"
+		} else if strings.Contains(outputStr, "timeout") {
+			result.Error = "Connection timeout"
+		} else if strings.Contains(outputStr, "login to server failed") {
+			result。Error = "Login failed"
+		}
+	}
+
+	return result
 }
 
-func (bt *BatchTester) setResult(id int, result TestResult) {
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
-	bt.results[id] = result
-}
-
-func (bt *BatchTester) createConfig(id int) (string, error) {
-	config := fmt.Sprintf(`[common]
+func (s *Scanner) createConfig(serverIP string) (string, error) {
+	config := fmt。Sprintf(`[common]
 server_addr = %s
-server_port = %d
+server_port = 7000
 token = %s
+login_fail_exit = true
+log_level = info
 
-[test-proxy-%d]
+[scanner-test]
 type = tcp
 local_ip = 127.0.0.1
-local_port = %d
-remote_port = %d
-`, bt.serverAddr, bt.serverPort, bt.token, id, 22, 20000+id)
+local_port = 22
+remote_port = 0
+`, serverIP, s.token)
 
-	configPath := filepath.Join(bt.tempDir, fmt.Sprintf("frpc-%d.ini", id))
+	configPath := filepath.Join(s.tempDir, fmt.Sprintf("frpc_%s.toml", strings.ReplaceAll(serverIP, ".", "_")))
 	return configPath, os.WriteFile(configPath, []byte(config), 0644)
 }
 
-func (bt *BatchTester) extractFrpcBinary() (string, error) {
-	// Try to find local frpc first
-	localFrpc := "frpc"
-	if runtime.GOOS == "windows" {
-		localFrpc = "frpc.exe"
-	}
-	
-	if _, err := os.Stat(localFrpc); err == nil {
-		log(fmt.Sprintf("Using local frpc binary: %s", localFrpc))
-		return filepath.Abs(localFrpc)
+func (s *Scanner) findFrpcBinary() (string， error) {
+	// Try local files first (for development)
+	localPaths := []string{
+		"frpc",
+		"frpc.exe"，
+		"./frpc"，
+		"./frpc.exe"，
 	}
 
+	for _, path := range localPaths {
+		if _, err := os。Stat(path); err == nil {
+			absPath, _ := filepath。Abs(path)
+			log(fmt.Sprintf("🔧 Using local frpc: %s", absPath))
+			return absPath, nil
+		}
+	}
+
+	// Try embedded binary
+	if embeddedPath, err := s.extractEmbeddedBinary(); err == nil {
+		return embeddedPath, nil
+	}
+
+	return "", fmt。Errorf("frpc binary not found. Please place frpc/frpc.exe in the same directory or use a build with embedded binaries")
+}
+
+func (s *Scanner) extractEmbeddedBinary() (string， error) {
 	// Determine the binary name based on current platform
 	var binaryName string
 	switch runtime.GOOS {
 	case "windows":
-		binaryName = fmt.Sprintf("frpc_%s_%s.exe", runtime.GOOS, runtime.GOARCH)
-	default:
+		binaryName = fmt。Sprintf("frpc_%s_%s.exe", runtime.GOOS, runtime.GOARCH)
+	默认:
 		binaryName = fmt.Sprintf("frpc_%s_%s", runtime.GOOS, runtime.GOARCH)
 	}
-
-	log(fmt.Sprintf("Looking for embedded binary: binaries/%s", binaryName))
 
 	// Try to read the binary from embedded files
 	data, err := embeddedBinaries.ReadFile("binaries/" + binaryName)
 	if err != nil {
-		return "", fmt.Errorf(`frpc binary not found for %s/%s.
-
-To use this tool:
-1. Download the appropriate frpc binary from https://github.com/fatedier/frp/releases
-2. Place it in the same directory as this program and name it 'frpc' (or 'frpc.exe' on Windows)
-3. Or use --mode proxy for protocol analysis without running frpc`, 
-			runtime.GOOS, runtime.GOARCH)
+		return "", fmt.Errorf("embedded frpc binary not found for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
 	// Check if the binary data looks valid
 	if len(data) < 1000 {
-		return "", fmt.Errorf("embedded frpc binary seems corrupted (too small: %d bytes)", len(data))
+		return "", fmt.Errorf("embedded frpc binary seems corrupted (too small: %d bytes)"， len(data))
 	}
 
 	// Write to temp file
-	frpcPath := filepath.Join(bt.tempDir, "frpc")
-	if runtime.GOOS == "windows" {
+	frpcPath := filepath。Join(s。tempDir, "frpc")
+	if runtime。GOOS == "windows" {
 		frpcPath += ".exe"
 	}
 
@@ -613,41 +390,146 @@ To use this tool:
 		return "", fmt.Errorf("failed to write frpc binary: %v", err)
 	}
 
-	log(fmt.Sprintf("Extracted frpc binary to: %s (size: %d bytes)", frpcPath, len(data)))
+	log(fmt.Sprintf("🔧 Using embedded frpc: %s (%d bytes)", frpcPath, len(data)))
 	return frpcPath, nil
 }
 
-func (bt *BatchTester) displayResults() {
+func extractRunID(output string) string {
+	// Pattern: "get run id [xxxxx]" or similar
+	patterns := []string{
+		`get run id \[([a-f0-9]+)\]`,
+		`run id \[([a-f0-9]+)\]`,
+		`login to server success.*?get run id \[([a-f0-9]+)\]`,
+	}
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		if matches := re.FindStringSubmatch(output); len(matches) > 1 {
+			return matches[1]
+		}
+	}
+
+	return ""
+}
+
+func (s *Scanner) showResults() {
 	fmt.Println()
-	log("=== Test Results ===")
-	
-	var successful, failed int
-	var totalDuration time.Duration
-	
-	for _, result := range bt.results {
-		status := "❌ FAILED"
+	log("📊 Scan Results Summary")
+	fmt.Println("═══════════════════════════════════════════════════════════════")
+
+	// Sort results by IP
+	sort.Slice(s.results, func(i, j int) bool {
+		return ipToInt(s.results[i].IP) < ipToInt(s.results[j].IP)
+	})
+
+	successful := []ScanResult{}
+	failed := []ScanResult{}
+
+	for _, result := range s.results {
 		if result.Success {
-			status = "✅ SUCCESS"
-			successful++
+			successful = append(successful, result)
 		} else {
-			failed++
+			failed = append(failed, result)
 		}
+	}
+
+	// Show successful results
+	if len(successful) > 0 {
+		fmt.Printf("✅ Successful Connections (%d):\n", len(successful))
+		fmt.Println("┌─────────────────┬──────┬─────────────────┬──────────────┐")
+		fmt.Println("│ IP Address      │ Port │ Run ID          │ Duration     │")
+		fmt.Println("├─────────────────┼──────┼─────────────────┼──────────────┤")
 		
-		errorMsg := ""
-		if result.Error != "" {
-			errorMsg = fmt.Sprintf(" (%s)", result.Error)
+		for _, result := range successful {
+			fmt.Printf("│ %-15s │ %-4d │ %-15s │ %-12v │\n",
+				result.IP, result.Port, result.RunID, result.Duration.Round(time.Millisecond))
 		}
+		fmt.Println("└─────────────────┴──────┴─────────────────┴──────────────┘")
+		fmt.Println()
+
+		// Save successful results to file
+		s.saveResults(successful)
+	}
+
+	// Show failed results summary
+	if len(failed) > 0 {
+		fmt.Printf("❌ Failed Connections (%d):\n", len(failed))
 		
-		fmt.Printf("[%2d] %s - %v%s\n", result.ID, status, result.Duration.Round(time.Millisecond), errorMsg)
-		totalDuration += result.Duration
+		// Group by error
+		errorGroups := make(map[string][]string)
+		for _, result := range failed {
+			errorGroups[result.Error] = append(errorGroups[result.Error], result.IP)
+		}
+
+		for error, ips := range errorGroups {
+			fmt.Printf("   %s: %d IPs\n", error, len(ips))
+			if len(ips) <= 5 {
+				fmt.Printf("     %s\n", strings.Join(ips, ", "))
+			} else {
+				fmt.Printf("     %s ... and %d more\n", strings.Join(ips[:5], ", "), len(ips)-5)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Statistics
+	total := len(s.results)
+	successRate := float64(len(successful)) / float64(total) * 100
+	
+	fmt.Printf("📈 Statistics:\n")
+	fmt.Printf("   Total tested: %d\n", total)
+	fmt.Printf("   Successful: %d (%.1f%%)\n", len(successful), successRate)
+	fmt.Printf("   Failed: %d (%.1f%%)\n", len(failed), 100-successRate)
+	
+	if len(successful) > 0 {
+		var totalDuration time.Duration
+		for _, result := range successful {
+			totalDuration += result.Duration
+		}
+		avgDuration := totalDuration / time.Duration(len(successful))
+		fmt.Printf("   Avg response time: %v\n", avgDuration.Round(time.Millisecond))
+	}
+}
+
+func (s *Scanner) saveResults(successful []ScanResult) {
+	filename := fmt.Sprintf("frp_servers_%s.txt", time.Now().Format("20060102_150405"))
+	
+	content := fmt.Sprintf("# FRP Server Scan Results\n")
+	content += fmt.Sprintf("# Scanned at: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	content += fmt.Sprintf("# Token: %s\n", maskToken(s.token))
+	content += fmt.Sprintf("# Total successful: %d\n\n", len(successful))
+	
+	for _, result := range successful {
+		content += fmt.Sprintf("%-15s:%-4d  # RunID: %s, Duration: %v\n",
+			result.IP, result.Port, result.RunID, result.Duration.Round(time.Millisecond))
+	}
+
+	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+		log("⚠️ Failed to save results to file: " + err.Error())
+	} else {
+		log("💾 Results saved to: " + filename)
+	}
+}
+
+func ipToInt(ip string) uint32 {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return 0
 	}
 	
-	fmt.Println()
-	log(fmt.Sprintf("Summary: %d successful, %d failed, %.2fs average", 
-		successful, failed, totalDuration.Seconds()/float64(len(bt.results))))
+	parsedIP = parsedIP.To4()
+	if parsedIP == nil {
+		return 0
+	}
 	
-	successRate := float64(successful) / float64(len(bt.results)) * 100
-	log(fmt.Sprintf("Success rate: %.1f%%", successRate))
+	return uint32(parsedIP[0])<<24 + uint32(parsedIP[1])<<16 + uint32(parsedIP[2])<<8 + uint32(parsedIP[3])
+}
+
+func maskToken(token string) string {
+	if len(token) <= 8 {
+		return strings.Repeat("*", len(token))
+	}
+	return token[:4] + strings.Repeat("*", len(token)-8) + token[len(token)-4:]
 }
 
 func log(msg string) {
