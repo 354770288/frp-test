@@ -19,12 +19,21 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Get latest FRP version
+    - name: Get latest FRP version and assets
       id: get-version
       run: |
-        FRP_VERSION=$(curl -s https://api.github.com/repos/fatedier/frp/releases/latest | jq -r '.tag_name')
+        echo "Fetching FRP release information..."
+        RELEASE_JSON=$(curl -s https://api.github.com/repos/fatedier/frp/releases/latest)
+        FRP_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+        
         echo "version=$FRP_VERSION" >> $GITHUB_OUTPUT
         echo "Latest FRP version: $FRP_VERSION"
+        
+        echo "Available assets:"
+        echo "$RELEASE_JSON" | jq -r '.assets[].name' | sort
+        
+        echo "" > available_assets.txt
+        echo "$RELEASE_JSON" | jq -r '.assets[].name' >> available_assets.txt
 
     - name: Download FRP binaries
       run: |
@@ -32,84 +41,129 @@ jobs:
         mkdir -p binaries temp
         FRP_VERSION="${{ steps.get-version.outputs.version }}"
         
-        # Define platforms and their corresponding archive names
+        echo "=== Downloading FRP binaries for version $FRP_VERSION ==="
+        
+        # Get available assets
+        RELEASE_JSON=$(curl -s https://api.github.com/repos/fatedier/frp/releases/latest)
+        echo "$RELEASE_JSON" | jq -r '.assets[].name' > available_assets.txt
+        
+        echo "Available assets:"
+        cat available_assets.txt
+        echo ""
+        
+        # Define platforms we want to support
         declare -A platforms=(
-          ["linux/amd64"]="linux_amd64.tar.gz"
-          ["linux/386"]="linux_386.tar.gz" 
-          ["linux/arm64"]="linux_arm64.tar.gz"
-          ["linux/arm"]="linux_arm.tar.gz"
-          ["windows/amd64"]="windows_amd64.zip"
-          ["windows/386"]="windows_386.zip"
-          ["windows/arm64"]="windows_arm64.zip"
-          ["darwin/amd64"]="darwin_amd64.tar.gz"
-          ["darwin/arm64"]="darwin_arm64.tar.gz"
+          ["linux/amd64"]="linux_amd64"
+          ["linux/386"]="linux_386"
+          ["linux/arm64"]="linux_arm64"
+          ["linux/arm"]="linux_arm"
+          ["windows/amd64"]="windows_amd64"
+          ["windows/386"]="windows_386"
+          ["windows/arm64"]="windows_arm64"
+          ["darwin/amd64"]="darwin_amd64"
+          ["darwin/arm64"]="darwin_arm64"
         )
         
         for platform_key in "${!platforms[@]}"; do
-          archive="${platforms[$platform_key]}"
+          platform_suffix="${platforms[$platform_key]}"
           goos=$(echo "$platform_key" | cut -d'/' -f1)
           goarch=$(echo "$platform_key" | cut -d'/' -f2)
           
-          url="https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/frp_${FRP_VERSION}_${archive}"
+          echo "=== Processing $goos/$goarch (${platform_suffix}) ==="
           
-          echo "Processing $goos/$goarch (${archive})..."
+          # Try to find the correct asset name
+          if [[ "$goos" == "windows" ]]; then
+            # For Windows, look for .zip files
+            asset_name=$(grep "frp_${FRP_VERSION}_${platform_suffix}\.zip$" available_assets.txt || echo "")
+          else
+            # For Linux/macOS, look for .tar.gz files
+            asset_name=$(grep "frp_${FRP_VERSION}_${platform_suffix}\.tar\.gz$" available_assets.txt || echo "")
+          fi
+          
+          if [[ -z "$asset_name" ]]; then
+            echo "⚠️  Asset not found for $goos/$goarch (expected pattern: frp_${FRP_VERSION}_${platform_suffix})"
+            echo "   Available assets matching pattern:"
+            grep "$platform_suffix" available_assets.txt || echo "   No matching assets found"
+            continue
+          fi
+          
+          echo "✓ Found asset: $asset_name"
+          
+          # Construct download URL
+          url="https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/${asset_name}"
+          echo "📥 Downloading: $url"
           
           # Clean temp directory
           rm -rf temp/*
           
-          if [[ $archive == *.zip ]]; then
-            # Handle ZIP files (Windows)
-            echo "Downloading ZIP: $url"
-            if wget -q "$url" -O temp/archive.zip; then
-              cd temp
-              echo "Extracting ZIP archive..."
-              if unzip -q archive.zip; then
-                # Find frpc.exe in the extracted directory
-                frpc_path=$(find . -name "frpc.exe" -type f | head -1)
-                if [[ -n "$frpc_path" ]]; then
-                  cp "$frpc_path" "../binaries/frpc_${goos}_${goarch}.exe"
-                  echo "✓ Extracted frpc.exe for $goos/$goarch"
-                else
-                  echo "✗ frpc.exe not found in ZIP for $goos/$goarch"
-                  ls -la
-                fi
+          # Download the file
+          if ! wget -q --show-progress "$url" -O "temp/archive"; then
+            echo "❌ Failed to download $asset_name"
+            echo "   Checking if URL exists..."
+            curl -I "$url" || echo "   URL check failed"
+            continue
+          fi
+          
+          echo "✓ Downloaded successfully"
+          
+          # Extract based on file type
+          cd temp
+          if [[ "$asset_name" == *.zip ]]; then
+            echo "📦 Extracting ZIP archive..."
+            if unzip -q archive; then
+              # Find frpc.exe in the extracted directory
+              frpc_path=$(find . -name "frpc.exe" -type f | head -1)
+              if [[ -n "$frpc_path" ]]; then
+                cp "$frpc_path" "../binaries/frpc_${goos}_${goarch}.exe"
+                echo "✅ Extracted frpc.exe for $goos/$goarch"
               else
-                echo "✗ Failed to extract ZIP for $goos/$goarch"
+                echo "❌ frpc.exe not found in archive"
+                echo "   Contents:"
+                find . -type f | head -10
               fi
-              cd ..
             else
-              echo "✗ Failed to download ZIP for $goos/$goarch"
+              echo "❌ Failed to extract ZIP"
             fi
           else
-            # Handle TAR.GZ files (Linux/macOS)
-            echo "Downloading TAR.GZ: $url"
-            if wget -q "$url" -O temp/archive.tar.gz; then
-              cd temp
-              echo "Extracting TAR.GZ archive..."
-              if tar -xzf archive.tar.gz; then
-                # Find frpc in the extracted directory
-                frpc_path=$(find . -name "frpc" -type f | head -1)
-                if [[ -n "$frpc_path" ]]; then
-                  cp "$frpc_path" "../binaries/frpc_${goos}_${goarch}"
-                  chmod +x "../binaries/frpc_${goos}_${goarch}"
-                  echo "✓ Extracted frpc for $goos/$goarch"
-                else
-                  echo "✗ frpc not found in TAR.GZ for $goos/$goarch"
-                  ls -la
-                fi
+            echo "📦 Extracting TAR.GZ archive..."
+            if tar -xzf archive; then
+              # Find frpc in the extracted directory
+              frpc_path=$(find . -name "frpc" -type f -executable | head -1)
+              if [[ -n "$frpc_path" ]]; then
+                cp "$frpc_path" "../binaries/frpc_${goos}_${goarch}"
+                chmod +x "../binaries/frpc_${goos}_${goarch}"
+                echo "✅ Extracted frpc for $goos/$goarch"
               else
-                echo "✗ Failed to extract TAR.GZ for $goos/$goarch"
+                echo "❌ frpc not found in archive"
+                echo "   Contents:"
+                find . -type f | head -10
               fi
-              cd ..
             else
-              echo "✗ Failed to download TAR.GZ for $goos/$goarch"
+              echo "❌ Failed to extract TAR.GZ"
             fi
           fi
+          cd ..
+          echo ""
         done
         
+        echo "=== Download Summary ==="
         echo "Final binaries:"
-        ls -la binaries/
-        echo "Binary count: $(ls binaries/ | wc -l)"
+        ls -la binaries/ || echo "No binaries created"
+        echo "Total binaries: $(ls binaries/ 2>/dev/null | wc -l)"
+
+    - name: Verify downloaded binaries
+      run: |
+        echo "=== Verifying Downloaded Binaries ==="
+        if [[ -d binaries && $(ls binaries/ 2>/dev/null | wc -l) -gt 0 ]]; then
+          for binary in binaries/*; do
+            echo "🔍 $binary:"
+            echo "   Size: $(stat -c%s "$binary" 2>/dev/null || stat -f%z "$binary" 2>/dev/null || echo "unknown") bytes"
+            echo "   Type: $(file "$binary" 2>/dev/null || echo "unknown")"
+          done
+        else
+          echo "⚠️  No binaries were successfully downloaded"
+          echo "The build will continue, but embedded binaries may not work"
+        fi
 
     - name: Upload FRP binaries
       uses: actions/upload-artifact@v4
@@ -176,10 +230,11 @@ jobs:
         name: frp-binaries
         path: binaries/
 
-    - name: Verify binaries
+    - name: Verify binaries for current platform
       run: |
+        echo "=== Verifying Binary for ${{ matrix.goos }}/${{ matrix.goarch }} ==="
         echo "Available binaries:"
-        ls -la binaries/ || echo "No binaries directory found"
+        ls -la binaries/ 2>/dev/null || echo "No binaries directory found"
         
         # Check if the required binary exists
         required_binary="frpc_${{ matrix.goos }}_${{ matrix.goarch }}"
@@ -188,15 +243,21 @@ jobs:
         fi
         
         if [[ -f "binaries/$required_binary" ]]; then
-          echo "✓ Found required binary: $required_binary"
-          file "binaries/$required_binary" || echo "File command not available"
+          echo "✅ Found required binary: $required_binary"
+          file_size=$(stat -c%s "binaries/$required_binary" 2>/dev/null || echo "unknown")
+          echo "   Size: $file_size bytes"
+          if [[ "$file_size" -lt 1000000 ]]; then
+            echo "⚠️  Binary seems too small (< 1MB), may be corrupted"
+          fi
         else
-          echo "✗ Required binary not found: $required_binary"
-          echo "This build will continue but the embedded binary won't work for this platform"
+          echo "⚠️  Required binary not found: $required_binary"
+          echo "   This platform will be built without embedded frpc binary"
         fi
 
-    - name: Get dependencies
-      run: go mod tidy
+    - name: Initialize Go module
+      run: |
+        go mod init github.com/yourusername/frp-batch-tester
+        go mod tidy
 
     - name: Build binary
       env:
@@ -214,7 +275,7 @@ jobs:
         fi
         FRP_VERSION="${{ needs.download-frp.outputs.frp-version }}"
         
-        echo "Building with:"
+        echo "=== Building Binary ==="
         echo "  Version: $VERSION"
         echo "  Build Time: $BUILD_TIME"
         echo "  FRP Version: $FRP_VERSION"
@@ -225,8 +286,12 @@ jobs:
           -o dist/frp-batch-tester-${{ matrix.name }}${{ matrix.ext }} \
           main.go
         
-        echo "Built binary:"
+        echo "✅ Built binary:"
         ls -la dist/
+        
+        # Test the binary
+        echo "🧪 Testing binary..."
+        ./dist/frp-batch-tester-${{ matrix.name }}${{ matrix.ext }} --version || echo "Version check failed, but build succeeded"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -247,10 +312,14 @@ jobs:
         path: artifacts
         merge-multiple: true
 
-    - name: List files
+    - name: Create release summary
       run: |
-        echo "Release artifacts:"
-        ls -la artifacts/
+        echo "=== Release Summary ===" > release_summary.txt
+        echo "FRP Version: ${{ needs.download-frp.outputs.frp-version }}" >> release_summary.txt
+        echo "Build Date: $(date -u)" >> release_summary.txt
+        echo "" >> release_summary.txt
+        echo "Binaries built:" >> release_summary.txt
+        ls -la artifacts/ >> release_summary.txt
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
@@ -264,14 +333,18 @@ jobs:
           
           This release includes embedded FRP binaries from version `${{ needs.download-frp.outputs.frp-version }}`.
           
-          ### Features
+          ### 🚀 Features
           - **Batch Testing Mode**: Run multiple frpc instances simultaneously
-          - **Proxy Analysis Mode**: Intercept and analyze FRP protocol messages
+          - **Proxy Analysis Mode**: Intercept and analyze FRP protocol messages  
           - **Embedded Binaries**: No need to download frpc separately
           - **Multi-Platform**: Support for Windows, macOS, and Linux
           
-          ### Usage
+          ### 📖 Usage
           
           **Batch Testing:**
           ```bash
+          # Test with 10 concurrent connections
           ./frp-batch-tester --server your-server.com --token your-token --count 10
+          
+          # Test HTTP proxies
+          ./frp-batch-tester --server your-server.com --token your-token --proxy-type http --count 5
