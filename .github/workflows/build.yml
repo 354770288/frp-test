@@ -9,7 +9,10 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
-
+# 添加权限配置
+permissions:
+  contents: write
+  packages: read
 jobs:
   download-frp:
     runs-on: ubuntu-latest
