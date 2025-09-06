@@ -77,15 +77,15 @@ jobs:
           local patterns=()
           if [[ "$goos" == "windows" ]]; then
             patterns+=(
-              "frp_${FRP_VERSION}_windows_${goarch}\.zip"
-              "frp_.*_windows_${goarch}\.zip"
+              "frp_${FRP_VERSION}_windows_${goarch}.zip"
+              "frp_.*_windows_${goarch}.zip"
               ".*windows.*${goarch}.*\.zip"
               ".*windows.*\.zip"
             )
           else
             patterns+=(
-              "frp_${FRP_VERSION}_${goos}_${goarch}\.tar\.gz"
-              "frp_.*_${goos}_${goarch}\.tar\.gz" 
+              "frp_${FRP_VERSION}_${goos}_${goarch}.tar.gz"
+              "frp_.*_${goos}_${goarch}.tar.gz" 
               ".*${goos}.*${goarch}.*\.tar\.gz"
               ".*${goos}.*\.tar\.gz"
             )
@@ -106,7 +106,8 @@ jobs:
           
           if [[ -z "$asset_name" ]]; then
             echo "❌ No asset found for $platform_display"
-            echo "   Tried patterns: ${patterns[*]}"
+            echo "   Tried patterns:"
+            printf '   - %s\n' "${patterns[@]}"
             echo "   Available assets containing '$goos':"
             grep -i "$goos" available_assets.txt || echo "   None found"
             return 1
@@ -215,7 +216,7 @@ jobs:
         # Download binaries for platforms (only try platforms that commonly exist)
         echo "=== Starting Downloads ==="
         
-        # Windows - try amd64 and arm64 (386 might not be available)
+        # Windows - try amd64 and arm64 first
         smart_download "Windows AMD64" "windows" "amd64" "frpc.exe" "frpc_windows_amd64.exe"
         smart_download "Windows ARM64" "windows" "arm64" "frpc.exe" "frpc_windows_arm64.exe"  
         
@@ -228,9 +229,10 @@ jobs:
         smart_download "macOS AMD64" "darwin" "amd64" "frpc" "frpc_darwin_amd64"
         smart_download "macOS ARM64" "darwin" "arm64" "frpc" "frpc_darwin_arm64"
         
-        # Try additional architectures if they exist
-        smart_download "Windows 386" "windows" "386" "frpc.exe" "frpc_windows_386.exe" || echo "Windows 386 not available, skipping"
-        smart_download "Linux 386" "linux" "386" "frpc" "frpc_linux_386" || echo "Linux 386 not available, skipping"
+        # Try additional architectures if they exist (don't fail if missing)
+        echo "=== Trying Optional Architectures ==="
+        smart_download "Windows 386" "windows" "386" "frpc.exe" "frpc_windows_386.exe" || echo "⚠️ Windows 386 not available, skipping"
+        smart_download "Linux 386" "linux" "386" "frpc" "frpc_linux_386" || echo "⚠️ Linux 386 not available, skipping"
         
         echo ""
         echo "=== Download Summary ==="
@@ -253,23 +255,23 @@ jobs:
         if [[ $(ls binaries/ 2>/dev/null | wc -l) -eq 0 ]]; then
           echo "Creating placeholder for artifact upload..."
           cat > binaries/README.txt << 'EOF'
-FRP Binaries Download Status
-===========================
-
-Some or all FRP binaries failed to download during the build process.
-This could be due to:
-
-1. Network issues during build
-2. Changes in FRP release asset names
-3. Unsupported platform architectures
-
-To use this application:
-1. Download frpc manually from: https://github.com/fatedier/frp/releases
-2. Place the frpc binary in the same directory as this application
-3. Ensure it's named 'frpc' (or 'frpc.exe' on Windows)
-
-The application will automatically detect and use local frpc binaries.
-EOF
+        FRP Binaries Download Status
+        ===========================
+        
+        Some or all FRP binaries failed to download during the build process.
+        This could be due to:
+        
+        1. Network issues during build
+        2. Changes in FRP release asset names
+        3. Unsupported platform architectures
+        
+        To use this application:
+        1. Download frpc manually from: https://github.com/fatedier/frp/releases
+        2. Place the frpc binary in the same directory as this application
+        3. Ensure it's named 'frpc' (or 'frpc.exe' on Windows)
+        
+        The application will automatically detect and use local frpc binaries.
+        EOF
           
           echo "Placeholder created. Build will continue."
         fi
