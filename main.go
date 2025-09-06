@@ -284,12 +284,15 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 
 	if err != nil {
 		// Don't include full error output as it might be verbose
-		if strings.Contains(string(output), "connection refused") {
+		outputStr := string(output)
+		if strings.Contains(outputStr, "connection refused") {
 			result.Error = "Connection refused"
-		} else if strings.Contains(string(output), "timeout") {
+		} else if strings.Contains(outputStr, "timeout") {
 			result.Error = "Connection timeout"
-		} else if strings.Contains(string(output), "login to server failed") {
+		} else if strings.Contains(outputStr, "login to server failed") {
 			result.Error = "Login failed"
+		} else if strings.Contains(outputStr, "authentication failed") {
+			result.Error = "Auth failed"
 		} else {
 			result.Error = "Connection failed"
 		}
@@ -308,7 +311,7 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 		} else if strings.Contains(outputStr, "timeout") {
 			result.Error = "Connection timeout"
 		} else if strings.Contains(outputStr, "login to server failed") {
-			result。Error = "Login failed"
+			result.Error = "Login failed"
 		}
 	}
 
@@ -316,7 +319,7 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 }
 
 func (s *Scanner) createConfig(serverIP string) (string, error) {
-	config := fmt。Sprintf(`[common]
+	config := fmt.Sprintf(`[common]
 server_addr = %s
 server_port = 7000
 token = %s
@@ -334,18 +337,18 @@ remote_port = 0
 	return configPath, os.WriteFile(configPath, []byte(config), 0644)
 }
 
-func (s *Scanner) findFrpcBinary() (string， error) {
+func (s *Scanner) findFrpcBinary() (string, error) {
 	// Try local files first (for development)
 	localPaths := []string{
 		"frpc",
-		"frpc.exe"，
-		"./frpc"，
-		"./frpc.exe"，
+		"frpc.exe",
+		"./frpc",
+		"./frpc.exe",
 	}
 
 	for _, path := range localPaths {
-		if _, err := os。Stat(path); err == nil {
-			absPath, _ := filepath。Abs(path)
+		if _, err := os.Stat(path); err == nil {
+			absPath, _ := filepath.Abs(path)
 			log(fmt.Sprintf("🔧 Using local frpc: %s", absPath))
 			return absPath, nil
 		}
@@ -356,16 +359,16 @@ func (s *Scanner) findFrpcBinary() (string， error) {
 		return embeddedPath, nil
 	}
 
-	return "", fmt。Errorf("frpc binary not found. Please place frpc/frpc.exe in the same directory or use a build with embedded binaries")
+	return "", fmt.Errorf("frpc binary not found. Please place frpc/frpc.exe in the same directory or use a build with embedded binaries")
 }
 
-func (s *Scanner) extractEmbeddedBinary() (string， error) {
+func (s *Scanner) extractEmbeddedBinary() (string, error) {
 	// Determine the binary name based on current platform
 	var binaryName string
 	switch runtime.GOOS {
 	case "windows":
-		binaryName = fmt。Sprintf("frpc_%s_%s.exe", runtime.GOOS, runtime.GOARCH)
-	默认:
+		binaryName = fmt.Sprintf("frpc_%s_%s.exe", runtime.GOOS, runtime.GOARCH)
+	default:
 		binaryName = fmt.Sprintf("frpc_%s_%s", runtime.GOOS, runtime.GOARCH)
 	}
 
@@ -377,12 +380,12 @@ func (s *Scanner) extractEmbeddedBinary() (string， error) {
 
 	// Check if the binary data looks valid
 	if len(data) < 1000 {
-		return "", fmt.Errorf("embedded frpc binary seems corrupted (too small: %d bytes)"， len(data))
+		return "", fmt.Errorf("embedded frpc binary seems corrupted (too small: %d bytes)", len(data))
 	}
 
 	// Write to temp file
-	frpcPath := filepath。Join(s。tempDir, "frpc")
-	if runtime。GOOS == "windows" {
+	frpcPath := filepath.Join(s.tempDir, "frpc")
+	if runtime.GOOS == "windows" {
 		frpcPath += ".exe"
 	}
 
@@ -395,11 +398,12 @@ func (s *Scanner) extractEmbeddedBinary() (string， error) {
 }
 
 func extractRunID(output string) string {
-	// Pattern: "get run id [xxxxx]" or similar
+	// Patterns to match FRP success responses
 	patterns := []string{
 		`get run id \[([a-f0-9]+)\]`,
 		`run id \[([a-f0-9]+)\]`,
 		`login to server success.*?get run id \[([a-f0-9]+)\]`,
+		`login to server success.*?run id \[([a-f0-9]+)\]`,
 	}
 
 	for _, pattern := range patterns {
@@ -461,8 +465,8 @@ func (s *Scanner) showResults() {
 			errorGroups[result.Error] = append(errorGroups[result.Error], result.IP)
 		}
 
-		for error, ips := range errorGroups {
-			fmt.Printf("   %s: %d IPs\n", error, len(ips))
+		for errorMsg, ips := range errorGroups {
+			fmt.Printf("   %s: %d IPs\n", errorMsg, len(ips))
 			if len(ips) <= 5 {
 				fmt.Printf("     %s\n", strings.Join(ips, ", "))
 			} else {
