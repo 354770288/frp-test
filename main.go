@@ -51,6 +51,15 @@ type Scanner struct {
 }
 
 func main() {
+	// Add defer to prevent immediate exit in Windows
+	defer func() {
+		if runtime.GOOS == "windows" {
+			fmt.Println("\n" + strings.Repeat("═", 60))
+			fmt.Println("Press Enter to exit...")
+			bufio.NewReader(os.Stdin).ReadString('\n')
+		}
+	}()
+
 	printBanner()
 
 	// Get user input
@@ -60,7 +69,7 @@ func main() {
 		token:       token,
 		concurrency: concurrency,
 		delay:       delay,
-		timeout:     10 * time.Second,
+		timeout:     15 * time.Second, // Increased timeout
 	}
 
 	// Create temp directory
@@ -68,7 +77,7 @@ func main() {
 	scanner.tempDir, err = os.MkdirTemp("", "frp-scanner-*")
 	if err != nil {
 		log("❌ Failed to create temp directory: " + err.Error())
-		os.Exit(1)
+		return
 	}
 	defer os.RemoveAll(scanner.tempDir)
 
@@ -76,7 +85,7 @@ func main() {
 	ips, err := parseTarget(target)
 	if err != nil {
 		log("❌ Invalid target: " + err.Error())
-		os.Exit(1)
+		return
 	}
 
 	log(fmt.Sprintf("🎯 Target: %s (%d IPs)", target, len(ips)))
@@ -115,6 +124,10 @@ func getUserInput() (string, string, int, time.Duration) {
 	
 	if target == "" {
 		log("❌ Target cannot be empty")
+		if runtime.GOOS == "windows" {
+			fmt.Println("Press Enter to exit...")
+			reader.ReadString('\n')
+		}
 		os.Exit(1)
 	}
 
@@ -122,8 +135,6 @@ func getUserInput() (string, string, int, time.Duration) {
 	fmt.Print("🔑 Enter FRP token (press Enter for no token): ")
 	token, _ := reader.ReadString('\n')
 	token = strings.TrimSpace(token)
-	
-	// Token is now optional, no exit required
 
 	// Get concurrency
 	fmt.Print("🚀 Enter concurrency (default 10): ")
@@ -209,6 +220,9 @@ func (s *Scanner) scan(ips []string) {
 
 	startTime := time.Now()
 
+	// Progress tracking
+	completed := 0
+
 	for i, ip := range ips {
 		s.wg.Add(1)
 		
@@ -228,12 +242,14 @@ func (s *Scanner) scan(ips []string) {
 			
 			s.mu.Lock()
 			s.results = append(s.results, result)
+			completed++
+			
 			if result.Success {
 				log(fmt.Sprintf("✅ [%d/%d] %s - SUCCESS (RunID: %s, %v)", 
-					len(s.results), len(ips), ip, result.RunID, result.Duration))
+					completed, len(ips), ip, result.RunID, result.Duration))
 			} else {
 				log(fmt.Sprintf("❌ [%d/%d] %s - FAILED (%s)", 
-					len(s.results), len(ips), ip, result.Error))
+					completed, len(ips), ip, result.Error))
 			}
 			s.mu.Unlock()
 		}(ip, i)
@@ -259,7 +275,11 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 		result.Duration = time.Since(start)
 		return result
 	}
-	defer os.Remove(configPath)
+	defer func() {
+		if err := os.Remove(configPath); err != nil {
+			// Ignore cleanup errors
+		}
+	}()
 
 	// Find frpc binary
 	frpcPath, err := s.findFrpcBinary()
@@ -274,6 +294,8 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, frpcPath, "-c", configPath)
+	
+	// Redirect stderr to capture all output
 	output, err := cmd.CombinedOutput()
 	
 	result.Duration = time.Since(start)
@@ -284,6 +306,12 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 	}
 
 	outputStr := string(output)
+
+	// Debug output for troubleshooting (remove in production)
+	if len(outputStr) > 0 {
+		// You can uncomment this for debugging
+		// fmt.Printf("[DEBUG] %s output: %s\n", ip, strings.TrimSpace(outputStr))
+	}
 
 	if err != nil {
 		// Parse error types for better error messages
@@ -299,26 +327,43 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 			result.Error = "Host not found"
 		} else if strings.Contains(outputStr, "network is unreachable") {
 			result.Error = "Network unreachable"
+		} else if strings.Contains(outputStr, "i/o timeout") {
+			result.Error = "I/O timeout"
+		} else if strings.Contains(outputStr, "connection reset") {
+			result.Error = "Connection reset"
 		} else {
 			result.Error = "Connection failed"
 		}
 		return result
 	}
 
-	// Parse output for success
+	// Parse output for success - enhanced detection
 	if runID := extractRunID(outputStr); runID != "" {
 		result.Success = true
 		result.RunID = runID
 	} else {
-		// Check if connection was established but no RunID found
-		if strings.Contains(outputStr, "login to server success") {
-			result.Success = true
-			result.RunID = "unknown"
-		} else if strings.Contains(outputStr, "start tunnel") {
+		// Check for other success indicators
+		successIndicators := []string{
+			"login to server success",
+			"start tunnel",
+			"proxy added",
+			"start frpc success",
+		}
+		
+		hasSuccess := false
+		for _, indicator := range successIndicators {
+			if strings.Contains(strings.ToLower(outputStr), strings.ToLower(indicator)) {
+				hasSuccess = true
+				break
+			}
+		}
+		
+		if hasSuccess {
 			result.Success = true
 			result.RunID = "connected"
 		} else {
 			result.Error = "No success indicator found"
+			// Still try to classify the error
 			if strings.Contains(outputStr, "connection refused") {
 				result.Error = "Connection refused"
 			} else if strings.Contains(outputStr, "timeout") {
@@ -373,10 +418,15 @@ remote_port = 0
 }
 
 func (s *Scanner) findFrpcBinary() (string, error) {
-	// Try local files first (for development)
+	// Try embedded binary first (for release builds)
+	if embeddedPath, err := s.extractEmbeddedBinary(); err == nil {
+		return embeddedPath, nil
+	}
+
+	// Try local files (for development)
 	localPaths := []string{
 		"frpc",
-		"frpc.exe",
+		"frpc.exe", 
 		"./frpc",
 		"./frpc.exe",
 	}
@@ -387,11 +437,6 @@ func (s *Scanner) findFrpcBinary() (string, error) {
 			log(fmt.Sprintf("🔧 Using local frpc: %s", absPath))
 			return absPath, nil
 		}
-	}
-
-	// Try embedded binary
-	if embeddedPath, err := s.extractEmbeddedBinary(); err == nil {
-		return embeddedPath, nil
 	}
 
 	return "", fmt.Errorf("frpc binary not found. Please place frpc/frpc.exe in the same directory or use a build with embedded binaries")
@@ -440,10 +485,12 @@ func extractRunID(output string) string {
 		`login to server success.*?get run id \[([a-f0-9]+)\]`,
 		`login to server success.*?run id \[([a-f0-9]+)\]`,
 		`\[.*?\] \[.*?\] \[([a-f0-9]+)\] login to server success`,
+		`runId=([a-f0-9]+)`,
+		`run_id:([a-f0-9]+)`,
 	}
 
 	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
+		re := regexp.MustCompile(`(?i)` + pattern) // Case insensitive
 		if matches := re.FindStringSubmatch(output); len(matches) > 1 {
 			return matches[1]
 		}
@@ -456,6 +503,11 @@ func (s *Scanner) showResults() {
 	fmt.Println()
 	log("📊 Scan Results Summary")
 	fmt.Println("═══════════════════════════════════════════════════════════════")
+
+	if len(s.results) == 0 {
+		fmt.Println("⚠️ No results to display")
+		return
+	}
 
 	// Sort results by IP
 	sort.Slice(s.results, func(i, j int) bool {
@@ -529,10 +581,25 @@ func (s *Scanner) showResults() {
 		avgDuration := totalDuration / time.Duration(len(successful))
 		fmt.Printf("   Avg response time: %v\n", avgDuration.Round(time.Millisecond))
 	}
+	
+	fmt.Println()
 }
 
 func (s *Scanner) saveResults(successful []ScanResult) {
+	if len(successful) == 0 {
+		log("ℹ️ No successful results to save")
+		return
+	}
+
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		log("⚠️ Failed to get current directory: " + err.Error())
+		cwd = "."
+	}
+
 	filename := fmt.Sprintf("frp_servers_%s.txt", time.Now().Format("20060102_150405"))
+	fullPath := filepath.Join(cwd, filename)
 	
 	content := fmt.Sprintf("# FRP Server Scan Results\n")
 	content += fmt.Sprintf("# Scanned at: %s\n", time.Now().Format("2006-01-02 15:04:05"))
@@ -548,10 +615,10 @@ func (s *Scanner) saveResults(successful []ScanResult) {
 			result.IP, result.Port, result.RunID, result.Duration.Round(time.Millisecond))
 	}
 
-	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
 		log("⚠️ Failed to save results to file: " + err.Error())
 	} else {
-		log("💾 Results saved to: " + filename)
+		log("💾 Results saved to: " + fullPath)
 	}
 }
 
