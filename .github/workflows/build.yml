@@ -1,4 +1,4 @@
-name: Build and Release
+name: Build with Embedded FRP Binaries
 
 on:
   push:
@@ -11,8 +11,114 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  download-frp:
     runs-on: ubuntu-latest
+    outputs:
+      frp-version: ${{ steps.get-version.outputs.version }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get latest FRP version
+      id: get-version
+      run: |
+        FRP_VERSION=$(curl -s https://api.github.com/repos/fatedier/frp/releases/latest | jq -r '.tag_name')
+        echo "version=$FRP_VERSION" >> $GITHUB_OUTPUT
+        echo "Latest FRP version: $FRP_VERSION"
+
+    - name: Download FRP binaries
+      run: |
+        mkdir -p binaries
+        FRP_VERSION="${{ steps.get-version.outputs.version }}"
+        
+        # Define platforms and their corresponding archive names
+        declare -A platforms=(
+          ["linux_amd64"]="linux_amd64.tar.gz"
+          ["linux_386"]="linux_386.tar.gz" 
+          ["linux_arm64"]="linux_arm64.tar.gz"
+          ["linux_arm"]="linux_arm.tar.gz"
+          ["windows_amd64"]="windows_amd64.zip"
+          ["windows_386"]="windows_386.zip"
+          ["windows_arm64"]="windows_arm64.zip"
+          ["darwin_amd64"]="darwin_amd64.tar.gz"
+          ["darwin_arm64"]="darwin_arm64.tar.gz"
+        )
+        
+        for platform in "${!platforms[@]}"; do
+          archive="${platforms[$platform]}"
+          url="https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/frp_${FRP_VERSION}_${archive}"
+          
+          echo "Downloading frp_${FRP_VERSION}_${archive}..."
+          
+          if [[ $archive == *.zip ]]; then
+            # Handle ZIP files
+            wget -q "$url" -O temp.zip
+            unzip -j temp.zip "*/frpc.exe" -d temp/ 2>/dev/null || unzip -j temp.zip "frp_${FRP_VERSION}_${platform}/frpc.exe" -d temp/
+            mv temp/frpc.exe binaries/frpc_${platform/_//}.exe
+            rm temp.zip
+            rmdir temp
+          else
+            # Handle TAR.GZ files
+            wget -q "$url" -O temp.tar.gz
+            tar -xzf temp.tar.gz --strip-components=1 -C temp/ "*/frpc" 2>/dev/null || tar -xzf temp.tar.gz --strip-components=1 -C temp/
+            mv temp/frpc binaries/frpc_${platform/_//}
+            rm temp.tar.gz
+            rm -rf temp
+          fi
+        done
+        
+        ls -la binaries/
+
+    - name: Upload FRP binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: frp-binaries
+        path: binaries/
+        retention-days: 1
+
+  build:
+    needs: download-frp
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            name: windows-amd64
+          - goos: windows
+            goarch: 386
+            ext: .exe
+            name: windows-386
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            name: windows-arm64
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            name: darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            name: darwin-arm64
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            name: linux-amd64
+          - goos: linux
+            goarch: 386
+            ext: ""
+            name: linux-386
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            name: linux-arm64
+          - goos: linux
+            goarch: arm
+            ext: ""
+            name: linux-arm
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -22,71 +128,84 @@ jobs:
       with:
         go-version: '1.21'
 
+    - name: Download FRP binaries
+      uses: actions/download-artifact@v4
+      with:
+        name: frp-binaries
+        path: binaries/
+
+    - name: Verify binaries
+      run: |
+        ls -la binaries/
+        file binaries/* || true
+
     - name: Get dependencies
       run: go mod tidy
 
-    - name: Build for all platforms
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
       run: |
         mkdir -p dist
         
-        # Define platforms
-        platforms=(
-          "windows/amd64/.exe"
-          "windows/386/.exe"
-          "windows/arm64/.exe"
-          "darwin/amd64/"
-          "darwin/arm64/"
-          "linux/amd64/"
-          "linux/386/"
-          "linux/arm64/"
-          "linux/arm/"
-        )
+        # Set build info
+        BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        VERSION=${GITHUB_REF#refs/tags/}
+        if [[ ! $VERSION =~ ^v[0-9] ]]; then
+          VERSION="dev-$(git rev-parse --short HEAD)"
+        fi
+        FRP_VERSION="${{ needs.download-frp.outputs.frp-version }}"
         
-        for platform in "${platforms[@]}"
-        do
-          GOOS=$(echo $platform | cut -d'/' -f1)
-          GOARCH=$(echo $platform | cut -d'/' -f2)
-          EXT=$(echo $platform | cut -d'/' -f3)
-          
-          OUTPUT_NAME="frp-tester-${GOOS}-${GOARCH}${EXT}"
-          echo "Building $OUTPUT_NAME..."
-          
-          env GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 go build \
-            -ldflags="-s -w" \
-            -o dist/$OUTPUT_NAME \
-            main.go
-        done
-        
-        ls -la dist/
+        go build \
+          -ldflags="-s -w -X 'main.Version=$VERSION' -X 'main.BuildTime=$BUILD_TIME' -X 'main.FrpVersion=$FRP_VERSION'" \
+          -o dist/frp-batch-tester-${{ matrix.name }}${{ matrix.ext }} \
+          main.go
 
-    - name: Upload all artifacts
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: all-binaries
-        path: dist/*
-        retention-days: 30
+        name: frp-batch-tester-${{ matrix.name }}
+        path: dist/frp-batch-tester-${{ matrix.name }}${{ matrix.ext }}
 
   release:
-    needs: build
+    needs: [download-frp, build]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     
     steps:
-    - name: Download artifacts
+    - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
-        name: all-binaries
-        path: dist
+        pattern: frp-batch-tester-*
+        path: artifacts
+        merge-multiple: true
 
     - name: List files
-      run: ls -la dist/
+      run: |
+        ls -la artifacts/
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/*
+        files: artifacts/*
         draft: false
         prerelease: false
         generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        body: |
+          ## FRP Batch Tester Release
+          
+          This release includes embedded FRP binaries from version `${{ needs.download-frp.outputs.frp-version }}`.
+          
+          ### Features
+          - **Batch Testing Mode**: Run multiple frpc instances simultaneously
+          - **Proxy Analysis Mode**: Intercept and analyze FRP protocol messages
+          - **Embedded Binaries**: No need to download frpc separately
+          - **Multi-Platform**: Support for Windows, macOS, and Linux
+          
+          ### Usage
+          
+          **Batch Testing:**
+          ```bash
+          ./frp-batch-tester --server your-server.com --token your-token --count 10
