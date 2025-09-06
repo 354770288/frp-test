@@ -81,7 +81,11 @@ func main() {
 
 	log(fmt.Sprintf("🎯 Target: %s (%d IPs)", target, len(ips)))
 	log(fmt.Sprintf("⚙️ Concurrency: %d, Delay: %v", concurrency, delay))
-	log(fmt.Sprintf("🔑 Token: %s", maskToken(token)))
+	if token == "" {
+		log("🔑 Token: [No token - testing without authentication]")
+	} else {
+		log(fmt.Sprintf("🔑 Token: %s", maskToken(token)))
+	}
 
 	// Start scanning
 	scanner.scan(ips)
@@ -114,15 +118,12 @@ func getUserInput() (string, string, int, time.Duration) {
 		os.Exit(1)
 	}
 
-	// Get token
-	fmt.Print("🔑 Enter FRP token: ")
+	// Get token (optional)
+	fmt.Print("🔑 Enter FRP token (press Enter for no token): ")
 	token, _ := reader.ReadString('\n')
 	token = strings.TrimSpace(token)
 	
-	if token == "" {
-		log("❌ Token cannot be empty")
-		os.Exit(1)
-	}
+	// Token is now optional, no exit required
 
 	// Get concurrency
 	fmt.Print("🚀 Enter concurrency (default 10): ")
@@ -282,9 +283,10 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 		return result
 	}
 
+	outputStr := string(output)
+
 	if err != nil {
-		// Don't include full error output as it might be verbose
-		outputStr := string(output)
+		// Parse error types for better error messages
 		if strings.Contains(outputStr, "connection refused") {
 			result.Error = "Connection refused"
 		} else if strings.Contains(outputStr, "timeout") {
@@ -293,6 +295,10 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 			result.Error = "Login failed"
 		} else if strings.Contains(outputStr, "authentication failed") {
 			result.Error = "Auth failed"
+		} else if strings.Contains(outputStr, "no such host") {
+			result.Error = "Host not found"
+		} else if strings.Contains(outputStr, "network is unreachable") {
+			result.Error = "Network unreachable"
 		} else {
 			result.Error = "Connection failed"
 		}
@@ -300,18 +306,28 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 	}
 
 	// Parse output for success
-	outputStr := string(output)
 	if runID := extractRunID(outputStr); runID != "" {
 		result.Success = true
 		result.RunID = runID
 	} else {
-		result.Error = "No run ID found in response"
-		if strings.Contains(outputStr, "connection refused") {
-			result.Error = "Connection refused"
-		} else if strings.Contains(outputStr, "timeout") {
-			result.Error = "Connection timeout"
-		} else if strings.Contains(outputStr, "login to server failed") {
-			result.Error = "Login failed"
+		// Check if connection was established but no RunID found
+		if strings.Contains(outputStr, "login to server success") {
+			result.Success = true
+			result.RunID = "unknown"
+		} else if strings.Contains(outputStr, "start tunnel") {
+			result.Success = true
+			result.RunID = "connected"
+		} else {
+			result.Error = "No success indicator found"
+			if strings.Contains(outputStr, "connection refused") {
+				result.Error = "Connection refused"
+			} else if strings.Contains(outputStr, "timeout") {
+				result.Error = "Connection timeout"
+			} else if strings.Contains(outputStr, "login to server failed") {
+				result.Error = "Login failed"
+			} else if strings.Contains(outputStr, "authentication failed") {
+				result.Error = "Auth failed"
+			}
 		}
 	}
 
@@ -319,7 +335,25 @@ func (s *Scanner) testSingleIP(ip string) ScanResult {
 }
 
 func (s *Scanner) createConfig(serverIP string) (string, error) {
-	config := fmt.Sprintf(`[common]
+	// Create config with or without token
+	var config string
+	if s.token == "" {
+		// Config without token
+		config = fmt.Sprintf(`[common]
+server_addr = %s
+server_port = 7000
+login_fail_exit = true
+log_level = info
+
+[scanner-test]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 22
+remote_port = 0
+`, serverIP)
+	} else {
+		// Config with token
+		config = fmt.Sprintf(`[common]
 server_addr = %s
 server_port = 7000
 token = %s
@@ -332,6 +366,7 @@ local_ip = 127.0.0.1
 local_port = 22
 remote_port = 0
 `, serverIP, s.token)
+	}
 
 	configPath := filepath.Join(s.tempDir, fmt.Sprintf("frpc_%s.toml", strings.ReplaceAll(serverIP, ".", "_")))
 	return configPath, os.WriteFile(configPath, []byte(config), 0644)
@@ -398,12 +433,13 @@ func (s *Scanner) extractEmbeddedBinary() (string, error) {
 }
 
 func extractRunID(output string) string {
-	// Patterns to match FRP success responses
+	// Enhanced patterns to match various FRP success responses
 	patterns := []string{
 		`get run id \[([a-f0-9]+)\]`,
 		`run id \[([a-f0-9]+)\]`,
 		`login to server success.*?get run id \[([a-f0-9]+)\]`,
 		`login to server success.*?run id \[([a-f0-9]+)\]`,
+		`\[.*?\] \[.*?\] \[([a-f0-9]+)\] login to server success`,
 	}
 
 	for _, pattern := range patterns {
@@ -500,7 +536,11 @@ func (s *Scanner) saveResults(successful []ScanResult) {
 	
 	content := fmt.Sprintf("# FRP Server Scan Results\n")
 	content += fmt.Sprintf("# Scanned at: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-	content += fmt.Sprintf("# Token: %s\n", maskToken(s.token))
+	if s.token == "" {
+		content += fmt.Sprintf("# Token: [No token used]\n")
+	} else {
+		content += fmt.Sprintf("# Token: %s\n", maskToken(s.token))
+	}
 	content += fmt.Sprintf("# Total successful: %d\n\n", len(successful))
 	
 	for _, result := range successful {
