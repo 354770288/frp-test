@@ -1,3 +1,9 @@
-module github.com/yourusername/frp-batch-tester
 
-go 1.19
+```go
+module frp-scanner
+
+go 1.21
+
+require (
+	// No external dependencies required
+)
