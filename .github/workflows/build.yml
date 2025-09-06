@@ -1,0 +1,216 @@
+name: Build Multi-Platform Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Windows
+          - os: windows
+            arch: amd64
+            extension: .exe
+          - os: windows
+            arch: 386
+            extension: .exe
+          - os: windows
+            arch: arm64
+            extension: .exe
+          
+          # macOS
+          - os: darwin
+            arch: amd64
+            extension: ""
+          - os: darwin
+            arch: arm64
+            extension: ""
+          
+          # Linux
+          - os: linux
+            arch: amd64
+            extension: ""
+          - os: linux
+            arch: 386
+            extension: ""
+          - os: linux
+            arch: arm64
+            extension: ""
+          - os: linux
+            arch: arm
+            extension: ""
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Get dependencies
+      run: go mod tidy
+
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+      run: |
+        mkdir -p dist
+        go build -ldflags="-s -w" -o dist/frp-tester-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }} main.go
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: frp-tester-${{ matrix.os }}-${{ matrix.arch }}
+        path: dist/frp-tester-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.extension }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        find artifacts -name "frp-tester-*" -exec cp {} release/ \;
+        ls -la release/
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/*
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 额外的任务：创建包含 frp 二进制文件的完整包
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download FRP releases
+      run: |
+        mkdir -p frp-binaries
+        
+        # 下载最新版本的 FRP
+        FRP_VERSION=$(curl -s https://api.github.com/repos/fatedier/frp/releases/latest | grep tag_name | cut -d '"' -f 4)
+        echo "Latest FRP version: $FRP_VERSION"
+        
+        # 下载不同平台的 FRP
+        platforms=("linux_amd64" "linux_arm64" "darwin_amd64" "darwin_arm64" "windows_amd64" "windows_386")
+        
+        for platform in "${platforms[@]}"; do
+          echo "Downloading FRP for $platform"
+          wget -q "https://github.com/fatedier/frp/releases/download/$FRP_VERSION/frp_${FRP_VERSION#v}_$platform.tar.gz" -O "frp_$platform.tar.gz" || true
+          if [ -f "frp_$platform.tar.gz" ]; then
+            tar -xzf "frp_$platform.tar.gz"
+            mkdir -p "frp-binaries/$platform"
+            cp -r "frp_${FRP_VERSION#v}_$platform"/* "frp-binaries/$platform/"
+            rm -rf "frp_${FRP_VERSION#v}_$platform" "frp_$platform.tar.gz"
+          fi
+        done
+
+    - name: Download our artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Create complete packages
+      run: |
+        mkdir -p packages
+        
+        # 创建不同平台的完整包
+        platforms=(
+          "linux-amd64:linux_amd64"
+          "linux-arm64:linux_arm64"
+          "darwin-amd64:darwin_amd64"
+          "darwin-arm64:darwin_arm64"
+          "windows-amd64:windows_amd64"
+          "windows-386:windows_386"
+        )
+        
+        for platform_mapping in "${platforms[@]}"; do
+          our_platform=${platform_mapping%:*}
+          frp_platform=${platform_mapping#*:}
+          
+          echo "Creating package for $our_platform"
+          
+          # 创建包目录
+          pkg_dir="packages/frp-batch-tester-$our_platform"
+          mkdir -p "$pkg_dir"
+          
+          # 复制我们的二进制文件
+          if [ -f "artifacts/frp-tester-$our_platform/frp-tester-${our_platform}"* ]; then
+            cp artifacts/frp-tester-$our_platform/frp-tester-${our_platform}* "$pkg_dir/"
+          fi
+          
+          # 复制 FRP 二进制文件
+          if [ -d "frp-binaries/$frp_platform" ]; then
+            cp frp-binaries/$frp_platform/frpc* "$pkg_dir/" 2>/dev/null || true
+          fi
+          
+          # 复制配置文件示例
+          cp config/frpc.toml.example "$pkg_dir/frpc.toml" 2>/dev/null || true
+          
+          # 创建说明文件
+          cat > "$pkg_dir/README.txt" << EOF
+FRP Batch Tester - Complete Package
+
+Files included:
+- frp-tester-$our_platform: The batch testing tool
+- frpc: FRP client binary
+- frpc.toml: Configuration file (please modify as needed)
+
+Usage:
+1. Configure frpc.toml with your settings
+2. Run: ./frp-tester-$our_platform
+3. Enter IP address or CIDR range when prompted
+
+For more information, visit:
+https://github.com/yourusername/frp-batch-tester
+EOF
+          
+          # 创建压缩包
+          if [[ "$our_platform" == *"windows"* ]]; then
+            (cd packages && zip -r "frp-batch-tester-$our_platform.zip" "frp-batch-tester-$our_platform/")
+          else
+            (cd packages && tar -czf "frp-batch-tester-$our_platform.tar.gz" "frp-batch-tester-$our_platform/")
+          fi
+          
+          # 清理目录
+          rm -rf "$pkg_dir"
+        done
+
+    - name: Upload complete packages
+      uses: softprops/action-gh-release@v1
+      with:
+        files: packages/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,5 @@
+# FRP Client Configuration Example
+# Copy this file to frpc.toml and modify as needed
+
+serverAddr = "your-frp-server.com"
+serverPort = 7000
